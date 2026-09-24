@@ -1,5 +1,5 @@
-import { createOpencodeClient } from '@opencode-ai/sdk/v2';
-import { buildDeferredRestartResponse } from './config-mutation-response.js';
+import { OpenCode } from '@opencode/client';
+import { buildAppliedResponse } from './config-mutation-response.js';
 import { OPENCODE_CONFIG_DIR } from './shared.js';
 
 /**
@@ -131,16 +131,18 @@ export const registerSkillRoutes = (app, dependencies) => {
     }
 
     try {
-      const client = createOpencodeClient({
+      const client = OpenCode.make({
         baseUrl: buildOpenCodeUrl('/', '').replace(/\/$/, ''),
-        directory: workingDirectory || undefined,
-        headers: getOpenCodeAuthHeaders(),
-        fetch: (request) => fetch(request, { signal: AbortSignal.timeout(8_000) }),
+        headers: {
+          ...getOpenCodeAuthHeaders(),
+          // v2 scopes a request with a header, not a `directory` option, and
+          // rejects non-ASCII header values, so the path is percent-encoded.
+          ...(workingDirectory ? { 'x-opencode-directory': encodeURIComponent(workingDirectory) } : {}),
+        },
+        fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(8_000) }),
       });
 
-      const response = await client.app.skills(
-        workingDirectory ? { directory: workingDirectory } : undefined,
-      );
+      const response = await client.skill.list();
       const payload = response?.data;
       if (!Array.isArray(payload)) {
         return [];
@@ -149,7 +151,13 @@ export const registerSkillRoutes = (app, dependencies) => {
       return payload
         .map((item) => {
           const name = typeof item?.name === 'string' ? item.name.trim() : '';
-          const location = typeof item?.location === 'string' ? item.location : '';
+          // OpenCode v1's skill payload used `location`; v2 renamed the field
+          // to `path`. Accept both, or the whole authoritative list is dropped
+          // and the panel falls back to the (smaller) local disk scan.
+          const rawLocation = typeof item?.path === 'string' ? item.path : (typeof item?.location === 'string' ? item.location : '');
+          // v1 marked built-in skills with `<built-in>`; v2 gives them a synthetic
+          // `/builtin/<id>.md` path. Normalize so they stay read-only in the panel.
+          const location = rawLocation.startsWith('/builtin/') ? '<built-in>' : rawLocation;
           const description = typeof item?.description === 'string' ? item.description : '';
           const content = typeof item?.content === 'string' ? item.content : '';
           if (!name || !location) {
@@ -510,14 +518,14 @@ export const registerSkillRoutes = (app, dependencies) => {
 
       const installed = result.installed || [];
       const skipped = result.skipped || [];
-      const requiresRestart = installed.length > 0;
+      const installedAny = installed.length > 0;
 
       res.json({
         ok: true,
         installed,
         skipped,
-        ...(requiresRestart
-          ? buildDeferredRestartResponse('Skills installed successfully. Restart OpenCode to apply.')
+        ...(installedAny
+          ? buildAppliedResponse('Skills installed successfully.')
           : {
             requiresReload: false,
             message: 'No skills were installed',
@@ -602,8 +610,8 @@ export const registerSkillRoutes = (app, dependencies) => {
       console.log('[Server] Scope:', scope, 'Working directory:', directory);
 
       createSkill(skillName, { ...config, source: skillSource }, directory, scope);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} created successfully. Restart OpenCode to apply.`,
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} created successfully.`,
       ));
     } catch (error) {
       console.error('Failed to create skill:', error);
@@ -625,14 +633,11 @@ export const registerSkillRoutes = (app, dependencies) => {
         console.log(`[Server] Renaming skill: ${skillName} -> ${newName}`);
         console.log('[Server] Working directory:', directory);
         renameSkill(skillName, newName, directory);
-        await refreshOpenCodeAfterConfigChange('skill rename');
-
+        // OpenCode 2 watches the skills directories: the renamed folder is
+        // picked up like any other write, no restart and no client reload.
         return res.json({
-          success: true,
+          ...buildAppliedResponse(`Skill renamed to ${newName} successfully.`),
           name: newName,
-          requiresReload: true,
-          message: `Skill renamed to ${newName} successfully. Reloading interface…`,
-          reloadDelayMs: clientReloadDelayMs,
         });
       }
 
@@ -640,8 +645,8 @@ export const registerSkillRoutes = (app, dependencies) => {
       console.log('[Server] Working directory:', directory);
 
       updateSkill(skillName, updates, directory, updates?.targetPath);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} updated successfully. Restart OpenCode to apply.`,
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} updated successfully.`,
       ));
     } catch (error) {
       console.error('[Server] Failed to update skill:', error);
@@ -727,8 +732,8 @@ export const registerSkillRoutes = (app, dependencies) => {
       }
 
       deleteSkill(skillName, directory);
-      res.json(buildDeferredRestartResponse(
-        `Skill ${skillName} deleted successfully. Restart OpenCode to apply.`,
+      res.json(buildAppliedResponse(
+        `Skill ${skillName} deleted successfully.`,
       ));
     } catch (error) {
       console.error('Failed to delete skill:', error);
